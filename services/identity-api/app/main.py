@@ -18,6 +18,7 @@ from .schemas import (
     ForgotPasswordRequest,
     LoginRequest,
     MessageResponse,
+    MFAChallengeRequest,
     RefreshRequest,
     RegisterRequest,
     ResendVerificationRequest,
@@ -27,7 +28,7 @@ from .schemas import (
 )
 from .security import create_access_token, create_refresh_token, decode_token, hash_password, hash_refresh_token, verify_password
 
-app = FastAPI(title=settings.app_name, version="0.6.0")
+app = FastAPI(title=settings.app_name, version="0.7.0")
 bearer = HTTPBearer(auto_error=False)
 
 
@@ -40,23 +41,17 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-async def current_user(
-    credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
-    db: AsyncSession = Depends(get_db),
-) -> User:
+async def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(bearer), db: AsyncSession = Depends(get_db)) -> User:
     if credentials is None or credentials.scheme.lower() != "bearer":
         raise HTTPException(status_code=401, detail="Authentication required")
     try:
         claims = decode_token(credentials.credentials)
-        if claims.get("type") != "access":
-            raise ValueError("wrong token type")
-        user_id = UUID(claims["sub"])
-        session_id = UUID(claims["sid"])
+        if claims.get("type") != "access": raise ValueError("wrong token type")
+        user_id, session_id = UUID(claims["sub"]), UUID(claims["sid"])
     except (ValueError, KeyError) as exc:
         raise HTTPException(status_code=401, detail="Invalid access token") from exc
     user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
-    if user is None or not user.is_active:
-        raise HTTPException(status_code=401, detail="User inactive or not found")
+    if user is None or not user.is_active: raise HTTPException(status_code=401, detail="User inactive or not found")
     session = (await db.execute(select(Session).where(Session.id == session_id, Session.user_id == user_id))).scalar_one_or_none()
     if session is None or session.revoked_at is not None or session.expires_at <= datetime.now(timezone.utc):
         raise HTTPException(status_code=401, detail="Session expired or revoked")
@@ -71,11 +66,20 @@ async def _create_email_verification(user: User, db: AsyncSession) -> str:
     return token
 
 
+async def _issue_session(user: User, db: AsyncSession) -> TokenResponse:
+    session_id = uuid4()
+    expires_at = datetime.now(timezone.utc) + timedelta(days=settings.refresh_token_days)
+    refresh_token = create_refresh_token(str(user.id), str(session_id), expires_at)
+    db.add(Session(id=session_id, user_id=user.id, refresh_token_hash=hash_refresh_token(refresh_token), expires_at=expires_at))
+    db.add(AuditEvent(actor_id=user.id, action="identity.user.login", resource_type="session", resource_id=str(session_id)))
+    await db.commit()
+    return TokenResponse(access_token=create_access_token(str(user.id), str(session_id)), refresh_token=refresh_token, expires_in=settings.access_token_minutes * 60, session_id=session_id)
+
+
 @app.post("/v1/auth/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db)) -> User:
     email = payload.email.lower()
-    if (await db.execute(select(User).where(User.email == email))).scalar_one_or_none() is not None:
-        raise HTTPException(status_code=409, detail="Email already registered")
+    if (await db.execute(select(User).where(User.email == email))).scalar_one_or_none() is not None: raise HTTPException(status_code=409, detail="Email already registered")
     user = User(email=email, password_hash=hash_password(payload.password), display_name=payload.display_name)
     db.add(user)
     await db.flush()
@@ -89,15 +93,11 @@ async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db))
 @app.post("/v1/auth/verify-email", response_model=MessageResponse)
 async def verify_email(payload: EmailVerificationRequest, db: AsyncSession = Depends(get_db)) -> MessageResponse:
     now = datetime.now(timezone.utc)
-    digest = hash_verification_token(payload.token)
-    record = (await db.execute(select(EmailVerificationToken).where(EmailVerificationToken.token_hash == digest, EmailVerificationToken.used_at.is_(None)))).scalar_one_or_none()
-    if record is None or record.expires_at <= now:
-        raise HTTPException(status_code=400, detail="Invalid or expired verification token")
+    record = (await db.execute(select(EmailVerificationToken).where(EmailVerificationToken.token_hash == hash_verification_token(payload.token), EmailVerificationToken.used_at.is_(None)))).scalar_one_or_none()
+    if record is None or record.expires_at <= now: raise HTTPException(status_code=400, detail="Invalid or expired verification token")
     user = (await db.execute(select(User).where(User.id == record.user_id))).scalar_one_or_none()
-    if user is None or not user.is_active:
-        raise HTTPException(status_code=400, detail="User unavailable")
-    record.used_at = now
-    user.email_verified = True
+    if user is None or not user.is_active: raise HTTPException(status_code=400, detail="User unavailable")
+    record.used_at, user.email_verified = now, True
     db.add(AuditEvent(actor_id=user.id, action="identity.email_verification.completed", resource_type="user", resource_id=str(user.id)))
     await db.commit()
     return MessageResponse(message="Email verified")
@@ -112,37 +112,37 @@ async def resend_verification(payload: ResendVerificationRequest, db: AsyncSessi
     return MessageResponse(message="If the account requires verification, a new verification token has been issued")
 
 
-@app.post("/v1/auth/login", response_model=TokenResponse)
-async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)) -> TokenResponse:
+@app.post("/v1/auth/login", response_model=TokenResponse | MessageResponse)
+async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)) -> TokenResponse | MessageResponse:
     user = (await db.execute(select(User).where(User.email == payload.email.lower()))).scalar_one_or_none()
-    if user is None or not verify_password(payload.password, user.password_hash) or not user.is_active:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    if not user.email_verified:
-        raise HTTPException(status_code=403, detail="Email verification required")
+    if user is None or not verify_password(payload.password, user.password_hash) or not user.is_active: raise HTTPException(status_code=401, detail="Invalid credentials")
+    if not user.email_verified: raise HTTPException(status_code=403, detail="Email verification required")
     if user.mfa_enabled:
-        raise HTTPException(status_code=403, detail="MFA verification required")
+        return MessageResponse(message="MFA verification required")
     return await _issue_session(user, db)
 
 
-async def _issue_session(user: User, db: AsyncSession) -> TokenResponse:
-    session_id = uuid4()
-    expires_at = datetime.now(timezone.utc) + timedelta(days=settings.refresh_token_days)
-    refresh_token = create_refresh_token(str(user.id), str(session_id), expires_at)
-    db.add(Session(id=session_id, user_id=user.id, refresh_token_hash=hash_refresh_token(refresh_token), expires_at=expires_at))
-    db.add(AuditEvent(actor_id=user.id, action="identity.user.login", resource_type="session", resource_id=str(session_id)))
-    await db.commit()
-    return TokenResponse(access_token=create_access_token(str(user.id), str(session_id)), refresh_token=refresh_token, expires_in=settings.access_token_minutes * 60, session_id=session_id)
+@app.post("/v1/auth/mfa/challenge", response_model=TokenResponse)
+async def mfa_challenge(payload: MFAChallengeRequest, db: AsyncSession = Depends(get_db)) -> TokenResponse:
+    user = (await db.execute(select(User).where(User.email == payload.email.lower()))).scalar_one_or_none()
+    if user is None or not user.is_active or not verify_password(payload.password, user.password_hash): raise HTTPException(status_code=401, detail="Invalid credentials")
+    if not user.email_verified: raise HTTPException(status_code=403, detail="Email verification required")
+    if not user.mfa_enabled or not user.mfa_secret: raise HTTPException(status_code=400, detail="MFA is not enabled")
+    if not verify_totp(user.mfa_secret, payload.code):
+        db.add(AuditEvent(actor_id=user.id, action="identity.mfa.challenge_failed", resource_type="user", resource_id=str(user.id)))
+        await db.commit()
+        raise HTTPException(status_code=401, detail="Invalid MFA code")
+    db.add(AuditEvent(actor_id=user.id, action="identity.mfa.challenge_succeeded", resource_type="user", resource_id=str(user.id)))
+    return await _issue_session(user, db)
 
 
 @app.post("/v1/auth/mfa/setup")
 async def mfa_setup(user: User = Depends(current_user), db: AsyncSession = Depends(get_db)) -> dict[str, object]:
-    if user.mfa_enabled:
-        raise HTTPException(status_code=409, detail="MFA already enabled")
+    if user.mfa_enabled: raise HTTPException(status_code=409, detail="MFA already enabled")
     setup = create_mfa_setup(user.email)
     user.mfa_secret = setup.secret
     await db.execute(update(RecoveryCode).where(RecoveryCode.user_id == user.id, RecoveryCode.used_at.is_(None)).values(used_at=datetime.now(timezone.utc)))
-    for code in setup.recovery_codes:
-        db.add(RecoveryCode(user_id=user.id, code_hash=hash_recovery_code(code)))
+    for code in setup.recovery_codes: db.add(RecoveryCode(user_id=user.id, code_hash=hash_recovery_code(code)))
     db.add(AuditEvent(actor_id=user.id, action="identity.mfa.setup_started", resource_type="user", resource_id=str(user.id)))
     await db.commit()
     return {"otpauth_uri": setup.otpauth_uri, "recovery_codes": list(setup.recovery_codes)}
@@ -150,8 +150,7 @@ async def mfa_setup(user: User = Depends(current_user), db: AsyncSession = Depen
 
 @app.post("/v1/auth/mfa/verify", response_model=MessageResponse)
 async def mfa_verify(code: str, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)) -> MessageResponse:
-    if not user.mfa_secret or not verify_totp(user.mfa_secret, code):
-        raise HTTPException(status_code=401, detail="Invalid MFA code")
+    if not user.mfa_secret or not verify_totp(user.mfa_secret, code): raise HTTPException(status_code=401, detail="Invalid MFA code")
     user.mfa_enabled = True
     db.add(AuditEvent(actor_id=user.id, action="identity.mfa.enabled", resource_type="user", resource_id=str(user.id)))
     await db.commit()
@@ -161,11 +160,9 @@ async def mfa_verify(code: str, user: User = Depends(current_user), db: AsyncSes
 @app.post("/v1/auth/mfa/recovery", response_model=TokenResponse)
 async def mfa_recovery(email: str, password: str, recovery_code: str, db: AsyncSession = Depends(get_db)) -> TokenResponse:
     user = (await db.execute(select(User).where(User.email == email.lower()))).scalar_one_or_none()
-    if user is None or not verify_password(password, user.password_hash) or not user.is_active:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+    if user is None or not verify_password(password, user.password_hash) or not user.is_active: raise HTTPException(status_code=401, detail="Invalid credentials")
     row = (await db.execute(select(RecoveryCode).where(RecoveryCode.user_id == user.id, RecoveryCode.code_hash == hash_recovery_code(recovery_code), RecoveryCode.used_at.is_(None)))).scalar_one_or_none()
-    if row is None:
-        raise HTTPException(status_code=401, detail="Invalid or used recovery code")
+    if row is None: raise HTTPException(status_code=401, detail="Invalid or used recovery code")
     row.used_at = datetime.now(timezone.utc)
     db.add(AuditEvent(actor_id=user.id, action="identity.mfa.recovery_used", resource_type="user", resource_id=str(user.id)))
     await db.commit()
@@ -180,8 +177,6 @@ async def forgot_password(payload: ForgotPasswordRequest, db: AsyncSession = Dep
         db.add(PasswordResetToken(user_id=user.id, token_hash=digest, expires_at=expires_at))
         db.add(AuditEvent(actor_id=user.id, action="identity.password_reset.issued", resource_type="user", resource_id=str(user.id)))
         await db.commit()
-        # Delivery is intentionally delegated to the future Notification Service.
-        # The raw token is never returned from this endpoint.
         _ = token
     return MessageResponse(message="If the account exists, password reset instructions have been issued")
 
@@ -189,13 +184,10 @@ async def forgot_password(payload: ForgotPasswordRequest, db: AsyncSession = Dep
 @app.post("/v1/auth/reset-password", response_model=MessageResponse)
 async def reset_password(payload: ResetPasswordRequest, db: AsyncSession = Depends(get_db)) -> MessageResponse:
     now = datetime.now(timezone.utc)
-    digest = hash_reset_token(payload.token)
-    record = (await db.execute(select(PasswordResetToken).where(PasswordResetToken.token_hash == digest, PasswordResetToken.used_at.is_(None)))).scalar_one_or_none()
-    if record is None or record.expires_at <= now:
-        raise HTTPException(status_code=400, detail="Invalid or expired password reset token")
+    record = (await db.execute(select(PasswordResetToken).where(PasswordResetToken.token_hash == hash_reset_token(payload.token), PasswordResetToken.used_at.is_(None)))).scalar_one_or_none()
+    if record is None or record.expires_at <= now: raise HTTPException(status_code=400, detail="Invalid or expired password reset token")
     user = (await db.execute(select(User).where(User.id == record.user_id))).scalar_one_or_none()
-    if user is None or not user.is_active:
-        raise HTTPException(status_code=400, detail="User unavailable")
+    if user is None or not user.is_active: raise HTTPException(status_code=400, detail="User unavailable")
     user.password_hash = hash_password(payload.new_password)
     record.used_at = now
     await db.execute(update(Session).where(Session.user_id == user.id, Session.revoked_at.is_(None)).values(revoked_at=now))
@@ -208,15 +200,12 @@ async def reset_password(payload: ResetPasswordRequest, db: AsyncSession = Depen
 async def refresh(payload: RefreshRequest, db: AsyncSession = Depends(get_db)) -> TokenResponse:
     try:
         claims = decode_token(payload.refresh_token)
-        if claims.get("type") != "refresh":
-            raise ValueError("wrong token type")
+        if claims.get("type") != "refresh": raise ValueError("wrong token type")
         session_id, user_id = UUID(claims["sid"]), UUID(claims["sub"])
-    except (ValueError, KeyError) as exc:
-        raise HTTPException(status_code=401, detail="Invalid refresh token") from exc
+    except (ValueError, KeyError) as exc: raise HTTPException(status_code=401, detail="Invalid refresh token") from exc
     session = (await db.execute(select(Session).where(Session.id == session_id, Session.user_id == user_id))).scalar_one_or_none()
     now = datetime.now(timezone.utc)
-    if session is None or session.revoked_at is not None or session.expires_at <= now:
-        raise HTTPException(status_code=401, detail="Session expired or revoked")
+    if session is None or session.revoked_at is not None or session.expires_at <= now: raise HTTPException(status_code=401, detail="Session expired or revoked")
     if session.refresh_token_hash != hash_refresh_token(payload.refresh_token):
         session.revoked_at = now
         db.add(AuditEvent(actor_id=user_id, action="identity.security.refresh_reuse", resource_type="session", resource_id=str(session_id)))
@@ -228,20 +217,17 @@ async def refresh(payload: RefreshRequest, db: AsyncSession = Depends(get_db)) -
 
 
 @app.get("/v1/me", response_model=UserResponse)
-async def me(user: User = Depends(current_user)) -> User:
-    return user
+async def me(user: User = Depends(current_user)) -> User: return user
 
 
 @app.post("/v1/auth/logout", response_model=MessageResponse)
 async def logout(user: User = Depends(current_user), credentials: HTTPAuthorizationCredentials | None = Depends(bearer), db: AsyncSession = Depends(get_db)) -> MessageResponse:
-    if credentials is None:
-        raise HTTPException(status_code=401, detail="Authentication required")
+    if credentials is None: raise HTTPException(status_code=401, detail="Authentication required")
     claims = decode_token(credentials.credentials)
-    session_id = UUID(claims["sid"])
-    session = (await db.execute(select(Session).where(Session.id == session_id, Session.user_id == user.id))).scalar_one_or_none()
+    session = (await db.execute(select(Session).where(Session.id == UUID(claims["sid"]), Session.user_id == user.id))).scalar_one_or_none()
     if session and session.revoked_at is None:
         session.revoked_at = datetime.now(timezone.utc)
-        db.add(AuditEvent(actor_id=user.id, action="identity.user.logout", resource_type="session", resource_id=str(session_id)))
+        db.add(AuditEvent(actor_id=user.id, action="identity.user.logout", resource_type="session", resource_id=str(session.id)))
         await db.commit()
     return MessageResponse(message="Logged out")
 
