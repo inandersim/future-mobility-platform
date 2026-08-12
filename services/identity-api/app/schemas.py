@@ -36,3 +36,11 @@ class UserResponse(BaseModel):
 
 class MessageResponse(BaseModel):
     message: str
+
+
+class EmailVerificationRequest(BaseModel):
+    token: str = Field(min_length=20, max_length=512)
+
+
+class ResendVerificationRequest(BaseModel):
+    email: EmailStr
