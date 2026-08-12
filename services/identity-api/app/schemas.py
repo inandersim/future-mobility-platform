@@ -37,6 +37,11 @@ class EmailVerificationRequest(BaseModel):
 class ResendVerificationRequest(BaseModel):
     email: EmailStr
 
+class MFAChallengeRequest(BaseModel):
+    email: EmailStr
+    password: str
+    code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+
 class ForgotPasswordRequest(BaseModel):
     email: EmailStr
 
