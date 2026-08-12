@@ -1,17 +1,21 @@
 from uuid import UUID
 from pydantic import BaseModel, EmailStr, Field
 
+
 class RegisterRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=12, max_length=128)
     display_name: str = Field(min_length=2, max_length=200)
 
+
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
 
+
 class RefreshRequest(BaseModel):
-    refresh_token: str
+    refresh_token: str = Field(min_length=20)
+
 
 class TokenResponse(BaseModel):
     access_token: str
@@ -20,6 +24,7 @@ class TokenResponse(BaseModel):
     expires_in: int
     session_id: UUID
 
+
 class UserResponse(BaseModel):
     id: UUID
     email: EmailStr
@@ -27,3 +32,7 @@ class UserResponse(BaseModel):
     is_active: bool
     email_verified: bool
     mfa_enabled: bool
+
+
+class MessageResponse(BaseModel):
+    message: str
