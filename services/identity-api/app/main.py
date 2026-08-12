@@ -3,7 +3,7 @@ from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import settings
@@ -19,7 +19,7 @@ from .security import (
     verify_password,
 )
 
-app = FastAPI(title=settings.app_name, version="0.2.0")
+app = FastAPI(title=settings.app_name, version="0.3.0")
 bearer = HTTPBearer(auto_error=False)
 
 
@@ -39,6 +39,7 @@ async def current_user(
         if claims.get("type") != "access":
             raise ValueError("wrong token type")
         user_id = UUID(claims["sub"])
+        session_id = UUID(claims["sid"])
     except (ValueError, KeyError) as exc:
         raise HTTPException(status_code=401, detail="Invalid access token") from exc
 
@@ -46,6 +47,16 @@ async def current_user(
     user = result.scalar_one_or_none()
     if user is None or not user.is_active:
         raise HTTPException(status_code=401, detail="User inactive or not found")
+
+    session_result = await db.execute(
+        select(Session).where(
+            Session.id == session_id,
+            Session.user_id == user_id,
+        )
+    )
+    session = session_result.scalar_one_or_none()
+    if session is None or session.revoked_at is not None or session.expires_at <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=401, detail="Session expired or revoked")
     return user
 
 
@@ -141,6 +152,7 @@ async def logout(
         session_id = UUID(claims["sid"])
     except (ValueError, KeyError) as exc:
         raise HTTPException(status_code=401, detail="Invalid access token") from exc
+
     result = await db.execute(select(Session).where(Session.id == session_id, Session.user_id == user.id))
     session = result.scalar_one_or_none()
     if session is not None and session.revoked_at is None:
@@ -148,3 +160,16 @@ async def logout(
         db.add(AuditEvent(actor_id=user.id, action="identity.user.logout", resource_type="session", resource_id=str(session_id)))
         await db.commit()
     return MessageResponse(message="Logged out")
+
+
+@app.post("/v1/auth/logout-all", response_model=MessageResponse)
+async def logout_all(user: User = Depends(current_user), db: AsyncSession = Depends(get_db)) -> MessageResponse:
+    now = datetime.now(timezone.utc)
+    await db.execute(
+        update(Session)
+        .where(Session.user_id == user.id, Session.revoked_at.is_(None))
+        .values(revoked_at=now)
+    )
+    db.add(AuditEvent(actor_id=user.id, action="identity.user.logout_all", resource_type="user", resource_id=str(user.id)))
+    await db.commit()
+    return MessageResponse(message="All sessions revoked")
